@@ -1073,6 +1073,14 @@ impl Builder {
         self
     }
 
+    /// Sets the [`SETTINGS_MAX_CONCURRENT_STREAMS`][spec] option for HTTP2
+    ///
+    /// [spec]: https://http2.github.io/http2-spec/#SETTINGS_MAX_CONCURRENT_STREAMS
+    pub fn http2_max_concurrent_streams(&mut self, sz: impl Into<Option<u32>>) -> &mut Self {
+        self.conn_builder.http2_max_concurrent_streams(sz);
+        self   
+    }
+
     /// Sets the [`SETTINGS_INITIAL_WINDOW_SIZE`][spec] option for HTTP2
     /// stream-level flow control.
     ///
@@ -1202,6 +1210,11 @@ impl Builder {
         self.conn_builder.http2_max_concurrent_reset_streams(max);
         self
     }
+
+    // pub fn http2_max_concurrent_streams(&mut self, max: usize) -> &mut Self {
+    //     self.conn_builder.http2_max_concurrent_streams(max);
+    //     self
+    // }
 
     /// Set whether to retry requests that get disrupted before ever starting
     /// to write.
