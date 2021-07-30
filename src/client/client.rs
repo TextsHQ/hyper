@@ -1211,11 +1211,6 @@ impl Builder {
         self
     }
 
-    // pub fn http2_max_concurrent_streams(&mut self, max: usize) -> &mut Self {
-    //     self.conn_builder.http2_max_concurrent_streams(max);
-    //     self
-    // }
-
     /// Set whether to retry requests that get disrupted before ever starting
     /// to write.
     ///
