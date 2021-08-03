@@ -82,8 +82,8 @@ fn new_builder(config: &Config) -> Builder {
         .max_concurrent_streams(config.max_concurrent_streams)
         .initial_window_size(config.initial_stream_window_size)
         .initial_connection_window_size(config.initial_conn_window_size)
-        .header_table_size(1024 * 64)
-        .max_frame_size(config.max_frame_size);
+        .header_table_size(1024 * 64);
+        // .max_frame_size(config.max_frame_size);
         // .enable_push(false);
     if let Some(max) = config.max_concurrent_reset_streams {
         builder.max_concurrent_reset_streams(max);
