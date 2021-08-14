@@ -32,6 +32,8 @@ type ConnEof = oneshot::Receiver<Never>;
 // Our defaults are chosen for the "majority" case, which usually are not
 // resource constrained, and so the spec default of 64kb can be too limiting
 // for performance.
+const DEFAULT_HEADER_LIST_SIZE: u32 = 1024 * 256;
+const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 1000;
 const DEFAULT_CONN_WINDOW: u32 = 1024 * 1024 * 5; // 5mb
 const DEFAULT_STREAM_WINDOW: u32 = 1024 * 1024 * 2; // 2mb
 const DEFAULT_MAX_FRAME_SIZE: u32 = 1024 * 16; // 16kb
@@ -39,6 +41,8 @@ const DEFAULT_MAX_FRAME_SIZE: u32 = 1024 * 16; // 16kb
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
     pub(crate) adaptive_window: bool,
+    pub(crate) max_header_list_size: u32,
+    pub(crate) max_concurrent_streams: u32,
     pub(crate) initial_conn_window_size: u32,
     pub(crate) initial_stream_window_size: u32,
     pub(crate) max_frame_size: u32,
@@ -55,6 +59,8 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             adaptive_window: false,
+            max_header_list_size: DEFAULT_HEADER_LIST_SIZE,
+            max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
             initial_conn_window_size: DEFAULT_CONN_WINDOW,
             initial_stream_window_size: DEFAULT_STREAM_WINDOW,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
@@ -72,10 +78,13 @@ impl Default for Config {
 fn new_builder(config: &Config) -> Builder {
     let mut builder = Builder::default();
     builder
+        .max_header_list_size(config.max_header_list_size)
+        .max_concurrent_streams(config.max_concurrent_streams)
         .initial_window_size(config.initial_stream_window_size)
         .initial_connection_window_size(config.initial_conn_window_size)
-        .max_frame_size(config.max_frame_size)
-        .enable_push(false);
+        .header_table_size(1024 * 64);
+        // .max_frame_size(config.max_frame_size);
+        // .enable_push(false);
     if let Some(max) = config.max_concurrent_reset_streams {
         builder.max_concurrent_reset_streams(max);
     }
