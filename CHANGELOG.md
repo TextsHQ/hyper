@@ -1,3 +1,79 @@
+### v0.14.16 (2021-12-09)
+
+
+#### Bug Fixes
+
+* **http1:** return 414 when URI contains more than 65534 characters (#2706) ([5f938fff](https://github.com/hyperium/hyper/commit/5f938fffa64df23a2e4af81ed4e6d8bd760e2d05), closes [#2701](https://github.com/hyperium/hyper/issues/2701))
+* **http2:** received `Body::size_hint()` now return 0 if implicitly empty (#2715) ([84b78b6c](https://github.com/hyperium/hyper/commit/84b78b6c877ff9aaa28d1e348a5deb63a9282503))
+* **server:** use case-insensitive comparison for Expect: 100-continue (#2709) ([7435cc33](https://github.com/hyperium/hyper/commit/7435cc3399895643062f4e399fae6d5b20b049a1), closes [#2708](https://github.com/hyperium/hyper/issues/2708))
+
+
+#### Features
+
+* **http2:** add `http2_max_send_buf_size` option to client and server ([bff977b7](https://github.com/hyperium/hyper/commit/bff977b73ca8d737f5492c86c09fd64735c45461))
+* **server:** add HTTP/1 header read timeout option (#2675) ([842c6553](https://github.com/hyperium/hyper/commit/842c6553a5414a3a4a0fbf973079200612a9c3d2), closes [#2457](https://github.com/hyperium/hyper/issues/2457))
+
+
+### v0.14.15 (2021-11-16)
+
+#### Bug Fixes
+
+* **client:** cancel blocking DNS lookup if `GaiFuture` is dropped ([174b553d](https://github.com/hyperium/hyper/commit/174b553d)
+
+#### Features
+
+* **http1:** add `http1_writev(bool)` options to Client and Server builders, to allow forcing vectored writes ([80627141](https://github.com/hyperium/hyper/commit/80627141))
+* **upgrade:** allow http upgrades with any body type ([ab469eb3](https://github.com/hyperium/hyper/commit/ab469eb3c6cd5e7a035d734f3d21ff4d2d6a21ab))
+
+
+### v0.14.14 (2021-10-22)
+
+
+#### Bug Fixes
+
+* **client:**
+  * make ResponseFuture implement Sync ([bd6c35b9](https://github.com/hyperium/hyper/commit/bd6c35b98f9513f14ed9cecad933bc7fdb8635ea))
+  * remove ipv6 square brackets before resolving ([910e0268](https://github.com/hyperium/hyper/commit/910e02687df3245aae4bc519fb0bd7eb6a34db7d))
+
+
+#### Features
+
+* **h2:** always include original h2 error on broken pipe ([6169db25](https://github.com/hyperium/hyper/commit/6169db250c932dd012d391389826cd34833077b4))
+* **server:** Remove Send + Sync requirement for Body in with_graceful_shutdown ([1d553e52](https://github.com/hyperium/hyper/commit/1d553e52c6953ea3b039f5c3f89d35cb56e2436a))
+
+
+### v0.14.13 (2021-09-16)
+
+
+#### Bug Fixes
+
+* **client:** don't reuse a connection while still flushing ([c88011da](https://github.com/hyperium/hyper/commit/c88011da4ed5b5ca9107c4a2339a7ab054c5f27f))
+* **server:** convert panic to error if Connection::without_shutdown called on HTTP/2 conn ([ea3e2282](https://github.com/hyperium/hyper/commit/ea3e228287e714b97aa44c840a487abd3a915e15))
+
+
+#### Features
+
+* **ffi:** add hyper_request_set_uri_parts ([a54689b9](https://github.com/hyperium/hyper/commit/a54689b921ca16dd0f29b3f4a74feae60218db34))
+* **lib:**
+  * Export more things with Cargo features (server, !http1, !http2) ([0a4b56ac](https://github.com/hyperium/hyper/commit/0a4b56acb82ef41a3336f482b240c67c784c434f))
+  * Export rt module independently of Cargo features ([cf6f62c7](https://github.com/hyperium/hyper/commit/cf6f62c71eda3b3a8732d86387e4ed8711cf9a86))
+
+
+### v0.14.12 (2021-08-24)
+
+
+#### Bug Fixes
+
+* **ffi:** on_informational callback had no headers ([39b6d01a](https://github.com/hyperium/hyper/commit/39b6d01aa0e520077bb25e16811f5ece00a224d6))
+* **http1:** apply header title case for consecutive dashes (#2613) ([684f2fa7](https://github.com/hyperium/hyper/commit/684f2fa76d44fa2b1b063ad0443a1b0d16dfad0e))
+* **http2:** improve errors emitted by HTTP2 `Upgraded` stream shutdown (#2622) ([be08648e](https://github.com/hyperium/hyper/commit/be08648e8298cdb13e9879ee761a73f827268962))
+
+
+#### Features
+
+* **client:** expose http09 and http1 options on `client::conn::Builder` (#2611) ([73bff4e9](https://github.com/hyperium/hyper/commit/73bff4e98c372ce04b006370c0b0d2af29ea8718), closes [#2461](https://github.com/hyperium/hyper/issues/2461))
+
+
 ### v0.14.11 (2021-07-21)
 
 

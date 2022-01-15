@@ -1,10 +1,8 @@
-// `mem::uninitialized` replaced with `mem::MaybeUninit`,
-// can't upgrade yet
-#![allow(deprecated)]
-
 use std::fmt::{self, Write};
-use std::mem;
+use std::mem::MaybeUninit;
 
+#[cfg(all(feature = "server", feature = "runtime"))]
+use tokio::time::Instant;
 #[cfg(any(test, feature = "server", feature = "ffi"))]
 use bytes::Bytes;
 use bytes::BytesMut;
@@ -12,6 +10,7 @@ use bytes::BytesMut;
 use http::header::ValueIter;
 use http::header::{self, Entry, HeaderName, HeaderValue};
 use http::{HeaderMap, Method, StatusCode, Version};
+use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::body::DecodedLength;
 #[cfg(feature = "server")]
@@ -26,6 +25,8 @@ use crate::proto::{BodyLength, MessageHead, RequestHead, RequestLine};
 
 const MAX_HEADERS: usize = 100;
 const AVERAGE_HEADER_SIZE: usize = 30; // totally scientific
+#[cfg(feature = "server")]
+const MAX_URI_LEN: usize = (u16::MAX - 1) as usize;
 
 macro_rules! header_name {
     ($bytes:expr) => {{
@@ -72,6 +73,26 @@ where
 
     let span = trace_span!("parse_headers");
     let _s = span.enter();
+
+    #[cfg(all(feature = "server", feature = "runtime"))]
+    if !*ctx.h1_header_read_timeout_running {
+        if let Some(h1_header_read_timeout) = ctx.h1_header_read_timeout {
+            let deadline = Instant::now() + h1_header_read_timeout;
+
+            match ctx.h1_header_read_timeout_fut {
+                Some(h1_header_read_timeout_fut) => {
+                    debug!("resetting h1 header read timeout timer");
+                    h1_header_read_timeout_fut.as_mut().reset(deadline);
+                }
+                None => {
+                    debug!("setting h1 header read timeout timer");
+                    *ctx.h1_header_read_timeout_fut =
+                        Some(Box::pin(tokio::time::sleep_until(deadline)));
+                }
+            }
+        }
+    }
+
     T::parse(bytes, ctx)
 }
 
@@ -115,23 +136,28 @@ impl Http1Transaction for Server {
         // but we *never* read any of it until after httparse has assigned
         // values into it. By not zeroing out the stack memory, this saves
         // a good ~5% on pipeline benchmarks.
-        let mut headers_indices: [HeaderIndices; MAX_HEADERS] = unsafe { mem::uninitialized() };
+        let mut headers_indices: [MaybeUninit<HeaderIndices>; MAX_HEADERS] = unsafe {
+            // SAFETY: We can go safely from MaybeUninit array to array of MaybeUninit
+            MaybeUninit::uninit().assume_init()
+        };
         {
-            let mut headers: [httparse::Header<'_>; MAX_HEADERS] = unsafe { mem::uninitialized() };
-            trace!(
-                "Request.parse([Header; {}], [u8; {}])",
-                headers.len(),
-                buf.len()
-            );
-            let mut req = httparse::Request::new(&mut headers);
+            /* SAFETY: it is safe to go from MaybeUninit array to array of MaybeUninit */
+            let mut headers: [MaybeUninit<httparse::Header<'_>>; MAX_HEADERS] =
+                unsafe { MaybeUninit::uninit().assume_init() };
+            trace!(bytes = buf.len(), "Request.parse");
+            let mut req = httparse::Request::new(&mut []);
             let bytes = buf.as_ref();
-            match req.parse(bytes) {
+            match req.parse_with_uninit_headers(bytes, &mut headers) {
                 Ok(httparse::Status::Complete(parsed_len)) => {
                     trace!("Request.parse Complete({})", parsed_len);
                     len = parsed_len;
+                    let uri = req.path.unwrap();
+                    if uri.len() > MAX_URI_LEN {
+                        return Err(Parse::UriTooLong);
+                    }
                     subject = RequestLine(
                         Method::from_bytes(req.method.unwrap().as_bytes())?,
-                        req.path.unwrap().parse()?,
+                        uri.parse()?,
                     );
                     version = if req.version.unwrap() == 1 {
                         keep_alive = true;
@@ -142,7 +168,6 @@ impl Http1Transaction for Server {
                         is_http_11 = false;
                         Version::HTTP_10
                     };
-                    trace!("headers: {:?}", &req.headers);
 
                     record_header_indices(bytes, &req.headers, &mut headers_indices)?;
                     headers_len = req.headers.len();
@@ -194,6 +219,8 @@ impl Http1Transaction for Server {
         headers.reserve(headers_len);
 
         for header in &headers_indices[..headers_len] {
+            // SAFETY: array is valid up to `headers_len`
+            let header = unsafe { &*header.as_ptr() };
             let name = header_name!(&slice[header.name.0..header.name.1]);
             let value = header_value!(slice.slice(header.value.0..header.value.1));
 
@@ -246,7 +273,10 @@ impl Http1Transaction for Server {
                     }
                 }
                 header::EXPECT => {
-                    expect_continue = value.as_bytes() == b"100-continue";
+                    // According to https://datatracker.ietf.org/doc/html/rfc2616#section-14.20
+                    // Comparison of expectation values is case-insensitive for unquoted tokens
+                    // (including the 100-continue token)
+                    expect_continue = value.as_bytes().eq_ignore_ascii_case(b"100-continue");
                 }
                 header::UPGRADE => {
                     // Upgrades are only allowed with HTTP/1.1
@@ -356,7 +386,7 @@ impl Http1Transaction for Server {
         }
 
         let orig_headers;
-        let extensions = mem::take(&mut msg.head.extensions);
+        let extensions = std::mem::take(&mut msg.head.extensions);
         let orig_headers = match extensions.get::<HeaderCaseMap>() {
             None if msg.title_case_headers => {
                 orig_headers = HeaderCaseMap::default();
@@ -388,6 +418,7 @@ impl Http1Transaction for Server {
             | Kind::Parse(Parse::Uri)
             | Kind::Parse(Parse::Version) => StatusCode::BAD_REQUEST,
             Kind::Parse(Parse::TooLarge) => StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            Kind::Parse(Parse::UriTooLong) => StatusCode::URI_TOO_LONG,
             _ => return None,
         };
 
@@ -550,7 +581,7 @@ impl Server {
     #[inline]
     fn encode_headers<W>(
         msg: Encode<'_, StatusCode>,
-        mut dst: &mut Vec<u8>,
+        dst: &mut Vec<u8>,
         mut is_last: bool,
         orig_len: usize,
         mut wrote_len: bool,
@@ -807,7 +838,7 @@ impl Server {
                             "content-length: ",
                             header::CONTENT_LENGTH,
                         );
-                        let _ = ::itoa::write(&mut dst, len);
+                        extend(dst, ::itoa::Buffer::new().format(len).as_bytes());
                         extend(dst, b"\r\n");
                         Encoder::length(len)
                     }
@@ -867,18 +898,22 @@ impl Http1Transaction for Client {
         // Loop to skip information status code headers (100 Continue, etc).
         loop {
             // Unsafe: see comment in Server Http1Transaction, above.
-            let mut headers_indices: [HeaderIndices; MAX_HEADERS] = unsafe { mem::uninitialized() };
+            let mut headers_indices: [MaybeUninit<HeaderIndices>; MAX_HEADERS] = unsafe {
+                // SAFETY: We can go safely from MaybeUninit array to array of MaybeUninit
+                MaybeUninit::uninit().assume_init()
+            };
             let (len, status, reason, version, headers_len) = {
-                let mut headers: [httparse::Header<'_>; MAX_HEADERS] =
-                    unsafe { mem::uninitialized() };
-                trace!(
-                    "Response.parse([Header; {}], [u8; {}])",
-                    headers.len(),
-                    buf.len()
-                );
-                let mut res = httparse::Response::new(&mut headers);
+                // SAFETY: We can go safely from MaybeUninit array to array of MaybeUninit
+                let mut headers: [MaybeUninit<httparse::Header<'_>>; MAX_HEADERS] =
+                    unsafe { MaybeUninit::uninit().assume_init() };
+                trace!(bytes = buf.len(), "Response.parse");
+                let mut res = httparse::Response::new(&mut []);
                 let bytes = buf.as_ref();
-                match ctx.h1_parser_config.parse_response(&mut res, bytes) {
+                match ctx.h1_parser_config.parse_response_with_uninit_headers(
+                    &mut res,
+                    bytes,
+                    &mut headers,
+                ) {
                     Ok(httparse::Status::Complete(len)) => {
                         trace!("Response.parse Complete({})", len);
                         let status = StatusCode::from_u16(res.code.unwrap())?;
@@ -934,6 +969,8 @@ impl Http1Transaction for Client {
 
             headers.reserve(headers_len);
             for header in &headers_indices[..headers_len] {
+                // SAFETY: array is valid up to `headers_len`
+                let header = unsafe { &*header.as_ptr() };
                 let name = header_name!(&slice[header.name.0..header.name.1]);
                 let value = header_value!(slice.slice(header.value.0..header.value.1));
 
@@ -1288,7 +1325,7 @@ struct HeaderIndices {
 fn record_header_indices(
     bytes: &[u8],
     headers: &[httparse::Header<'_>],
-    indices: &mut [HeaderIndices],
+    indices: &mut [MaybeUninit<HeaderIndices>],
 ) -> Result<(), crate::error::Parse> {
     let bytes_ptr = bytes.as_ptr() as usize;
 
@@ -1299,10 +1336,19 @@ fn record_header_indices(
         }
         let name_start = header.name.as_ptr() as usize - bytes_ptr;
         let name_end = name_start + header.name.len();
-        indices.name = (name_start, name_end);
         let value_start = header.value.as_ptr() as usize - bytes_ptr;
         let value_end = value_start + header.value.len();
-        indices.value = (value_start, value_end);
+
+        // FIXME(maybe_uninit_extra)
+        // FIXME(addr_of)
+        // Currently we don't have `ptr::addr_of_mut` in stable rust or
+        // MaybeUninit::write, so this is some way of assigning into a MaybeUninit
+        // safely
+        let new_header_indices = HeaderIndices {
+            name: (name_start, name_end),
+            value: (value_start, value_end),
+        };
+        *indices = MaybeUninit::new(new_header_indices);
     }
 
     Ok(())
@@ -1414,6 +1460,9 @@ mod tests {
                 cached_headers: &mut None,
                 req_method: &mut method,
                 h1_parser_config: Default::default(),
+                h1_header_read_timeout: None,
+                h1_header_read_timeout_fut: &mut None,
+                h1_header_read_timeout_running: &mut false,
                 preserve_header_case: false,
                 h09_responses: false,
                 #[cfg(feature = "ffi")]
@@ -1441,6 +1490,9 @@ mod tests {
             cached_headers: &mut None,
             req_method: &mut Some(crate::Method::GET),
             h1_parser_config: Default::default(),
+            h1_header_read_timeout: None,
+            h1_header_read_timeout_fut: &mut None,
+            h1_header_read_timeout_running: &mut false,
             preserve_header_case: false,
             h09_responses: false,
             #[cfg(feature = "ffi")]
@@ -1463,6 +1515,9 @@ mod tests {
             cached_headers: &mut None,
             req_method: &mut None,
             h1_parser_config: Default::default(),
+            h1_header_read_timeout: None,
+            h1_header_read_timeout_fut: &mut None,
+            h1_header_read_timeout_running: &mut false,
             preserve_header_case: false,
             h09_responses: false,
             #[cfg(feature = "ffi")]
@@ -1483,6 +1538,9 @@ mod tests {
             cached_headers: &mut None,
             req_method: &mut Some(crate::Method::GET),
             h1_parser_config: Default::default(),
+            h1_header_read_timeout: None,
+            h1_header_read_timeout_fut: &mut None,
+            h1_header_read_timeout_running: &mut false,
             preserve_header_case: false,
             h09_responses: true,
             #[cfg(feature = "ffi")]
@@ -1505,6 +1563,9 @@ mod tests {
             cached_headers: &mut None,
             req_method: &mut Some(crate::Method::GET),
             h1_parser_config: Default::default(),
+            h1_header_read_timeout: None,
+            h1_header_read_timeout_fut: &mut None,
+            h1_header_read_timeout_running: &mut false,
             preserve_header_case: false,
             h09_responses: false,
             #[cfg(feature = "ffi")]
@@ -1531,6 +1592,9 @@ mod tests {
             cached_headers: &mut None,
             req_method: &mut Some(crate::Method::GET),
             h1_parser_config,
+            h1_header_read_timeout: None,
+            h1_header_read_timeout_fut: &mut None,
+            h1_header_read_timeout_running: &mut false,
             preserve_header_case: false,
             h09_responses: false,
             #[cfg(feature = "ffi")]
@@ -1554,6 +1618,9 @@ mod tests {
             cached_headers: &mut None,
             req_method: &mut Some(crate::Method::GET),
             h1_parser_config: Default::default(),
+            h1_header_read_timeout: None,
+            h1_header_read_timeout_fut: &mut None,
+            h1_header_read_timeout_running: &mut false,
             preserve_header_case: false,
             h09_responses: false,
             #[cfg(feature = "ffi")]
@@ -1572,6 +1639,9 @@ mod tests {
             cached_headers: &mut None,
             req_method: &mut None,
             h1_parser_config: Default::default(),
+            h1_header_read_timeout: None,
+            h1_header_read_timeout_fut: &mut None,
+            h1_header_read_timeout_running: &mut false,
             preserve_header_case: true,
             h09_responses: false,
             #[cfg(feature = "ffi")]
@@ -1611,6 +1681,9 @@ mod tests {
                     cached_headers: &mut None,
                     req_method: &mut None,
                     h1_parser_config: Default::default(),
+                    h1_header_read_timeout: None,
+                    h1_header_read_timeout_fut: &mut None,
+                    h1_header_read_timeout_running: &mut false,
                     preserve_header_case: false,
                     h09_responses: false,
                     #[cfg(feature = "ffi")]
@@ -1631,6 +1704,9 @@ mod tests {
                     cached_headers: &mut None,
                     req_method: &mut None,
                     h1_parser_config: Default::default(),
+                    h1_header_read_timeout: None,
+                    h1_header_read_timeout_fut: &mut None,
+                    h1_header_read_timeout_running: &mut false,
                     preserve_header_case: false,
                     h09_responses: false,
                     #[cfg(feature = "ffi")]
@@ -1860,6 +1936,9 @@ mod tests {
                     cached_headers: &mut None,
                     req_method: &mut Some(Method::GET),
                     h1_parser_config: Default::default(),
+                    h1_header_read_timeout: None,
+                    h1_header_read_timeout_fut: &mut None,
+                    h1_header_read_timeout_running: &mut false,
                     preserve_header_case: false,
                     h09_responses: false,
                     #[cfg(feature = "ffi")]
@@ -1880,6 +1959,9 @@ mod tests {
                     cached_headers: &mut None,
                     req_method: &mut Some(m),
                     h1_parser_config: Default::default(),
+                    h1_header_read_timeout: None,
+                    h1_header_read_timeout_fut: &mut None,
+                    h1_header_read_timeout_running: &mut false,
                     preserve_header_case: false,
                     h09_responses: false,
                     #[cfg(feature = "ffi")]
@@ -1900,6 +1982,9 @@ mod tests {
                     cached_headers: &mut None,
                     req_method: &mut Some(Method::GET),
                     h1_parser_config: Default::default(),
+                    h1_header_read_timeout: None,
+                    h1_header_read_timeout_fut: &mut None,
+                    h1_header_read_timeout_running: &mut false,
                     preserve_header_case: false,
                     h09_responses: false,
                     #[cfg(feature = "ffi")]
@@ -2397,6 +2482,9 @@ mod tests {
                 cached_headers: &mut None,
                 req_method: &mut Some(Method::GET),
                 h1_parser_config: Default::default(),
+                h1_header_read_timeout: None,
+                h1_header_read_timeout_fut: &mut None,
+                h1_header_read_timeout_running: &mut false,
                 preserve_header_case: false,
                 h09_responses: false,
                 #[cfg(feature = "ffi")]
@@ -2481,6 +2569,9 @@ mod tests {
                     cached_headers: &mut headers,
                     req_method: &mut None,
                     h1_parser_config: Default::default(),
+                    h1_header_read_timeout: None,
+                    h1_header_read_timeout_fut: &mut None,
+                    h1_header_read_timeout_running: &mut false,
                     preserve_header_case: false,
                     h09_responses: false,
                     #[cfg(feature = "ffi")]
@@ -2521,6 +2612,9 @@ mod tests {
                     cached_headers: &mut headers,
                     req_method: &mut None,
                     h1_parser_config: Default::default(),
+                    h1_header_read_timeout: None,
+                    h1_header_read_timeout_fut: &mut None,
+                    h1_header_read_timeout_running: &mut false,
                     preserve_header_case: false,
                     h09_responses: false,
                     #[cfg(feature = "ffi")]

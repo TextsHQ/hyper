@@ -207,7 +207,7 @@ typedef int (*hyper_body_foreach_callback)(void*, const struct hyper_buf*);
 
 typedef int (*hyper_body_data_callback)(void*, struct hyper_context*, struct hyper_buf**);
 
-typedef void (*hyper_request_on_informational_callback)(void*, const struct hyper_response*);
+typedef void (*hyper_request_on_informational_callback)(void*, struct hyper_response*);
 
 typedef int (*hyper_headers_foreach_callback)(void*, const uint8_t*, size_t, const uint8_t*, size_t);
 
@@ -299,6 +299,8 @@ void hyper_body_set_data_func(struct hyper_body *body, hyper_body_data_callback 
 
  This makes an owned copy of the bytes, so the `buf` argument can be
  freed or changed afterwards.
+
+ This returns `NULL` if allocating a new buffer fails.
  */
 struct hyper_buf *hyper_buf_copy(const uint8_t *buf, size_t len);
 
@@ -423,10 +425,40 @@ enum hyper_code hyper_request_set_method(struct hyper_request *req,
 
 /*
  Set the URI of the request.
+
+ The request's URI is best described as the `request-target` from the RFCs. So in HTTP/1,
+ whatever is set will get sent as-is in the first line (GET $uri HTTP/1.1). It
+ supports the 4 defined variants, origin-form, absolute-form, authority-form, and
+ asterisk-form.
+
+ The underlying type was built to efficiently support HTTP/2 where the request-target is
+ split over :scheme, :authority, and :path. As such, each part can be set explicitly, or the
+ type can parse a single contiguous string and if a scheme is found, that slot is "set". If
+ the string just starts with a path, only the path portion is set. All pseudo headers that
+ have been parsed/set are sent when the connection type is HTTP/2.
+
+ To set each slot explicitly, use `hyper_request_set_uri_parts`.
  */
 enum hyper_code hyper_request_set_uri(struct hyper_request *req,
                                       const uint8_t *uri,
                                       size_t uri_len);
+
+/*
+ Set the URI of the request with separate scheme, authority, and
+ path/query strings.
+
+ Each of `scheme`, `authority`, and `path_and_query` should either be
+ null, to skip providing a component, or point to a UTF-8 encoded
+ string. If any string pointer argument is non-null, its corresponding
+ `len` parameter must be set to the string's length.
+ */
+enum hyper_code hyper_request_set_uri_parts(struct hyper_request *req,
+                                            const uint8_t *scheme,
+                                            size_t scheme_len,
+                                            const uint8_t *authority,
+                                            size_t authority_len,
+                                            const uint8_t *path_and_query,
+                                            size_t path_and_query_len);
 
 /*
  Set the preferred HTTP version of the request.
@@ -469,7 +501,7 @@ enum hyper_code hyper_request_set_body(struct hyper_request *req, struct hyper_b
  `hyper_response *` which can be inspected as any other response. The
  body of the response will always be empty.
 
- NOTE: The `const hyper_response *` is just borrowed data, and will not
+ NOTE: The `hyper_response *` is just borrowed data, and will not
  be valid after the callback finishes. You must copy any data you wish
  to persist.
  */

@@ -38,16 +38,15 @@ pub(super) enum Kind {
     #[allow(unused)]
     Connect,
     /// Error creating a TcpListener.
-    #[cfg(all(
-        any(feature = "http1", feature = "http2"),
-        feature = "tcp",
-        feature = "server"
-    ))]
+    #[cfg(all(feature = "tcp", feature = "server"))]
     Listen,
     /// Error accepting on an Incoming stream.
     #[cfg(any(feature = "http1", feature = "http2"))]
     #[cfg(feature = "server")]
     Accept,
+    /// User took too long to send headers
+    #[cfg(all(feature = "http1", feature = "server", feature = "runtime"))]
+    HeaderTimeout,
     /// Error while reading a body from connection.
     #[cfg(any(feature = "http1", feature = "http2", feature = "stream"))]
     Body,
@@ -72,6 +71,8 @@ pub(super) enum Parse {
     #[cfg(feature = "http1")]
     VersionH2,
     Uri,
+    #[cfg_attr(not(all(feature = "http1", feature = "server")), allow(unused))]
+    UriTooLong,
     Header(Header),
     TooLarge,
     Status,
@@ -132,6 +133,10 @@ pub(super) enum User {
     #[cfg(feature = "http1")]
     ManualUpgrade,
 
+    /// User called `server::Connection::without_shutdown()` on an HTTP/2 conn.
+    #[cfg(feature = "server")]
+    WithoutShutdownNonHttp1,
+
     /// User aborted in an FFI callback.
     #[cfg(feature = "ffi")]
     AbortedByCallback,
@@ -149,7 +154,10 @@ impl Error {
 
     /// Returns true if this was an HTTP parse error caused by a message that was too large.
     pub fn is_parse_too_large(&self) -> bool {
-        matches!(self.inner.kind, Kind::Parse(Parse::TooLarge))
+        matches!(
+            self.inner.kind,
+            Kind::Parse(Parse::TooLarge) | Kind::Parse(Parse::UriTooLong)
+        )
     }
 
     /// Returns true if this was an HTTP parse error caused by an invalid response status code or
@@ -265,8 +273,7 @@ impl Error {
         Error::new(Kind::Io).with(cause)
     }
 
-    #[cfg(all(any(feature = "http1", feature = "http2"), feature = "tcp"))]
-    #[cfg(feature = "server")]
+    #[cfg(all(feature = "server", feature = "tcp"))]
     pub(super) fn new_listen<E: Into<Cause>>(cause: E) -> Error {
         Error::new(Kind::Listen).with(cause)
     }
@@ -309,6 +316,11 @@ impl Error {
     #[cfg(feature = "server")]
     pub(super) fn new_user_header() -> Error {
         Error::new_user(User::UnexpectedHeader)
+    }
+
+    #[cfg(all(feature = "http1", feature = "server", feature = "runtime"))]
+    pub(super) fn new_header_timeout() -> Error {
+        Error::new(Kind::HeaderTimeout)
     }
 
     #[cfg(any(feature = "http1", feature = "http2"))]
@@ -360,6 +372,11 @@ impl Error {
         Error::new_user(User::Body).with(cause)
     }
 
+    #[cfg(feature = "server")]
+    pub(super) fn new_without_shutdown_not_h1() -> Error {
+        Error::new(Kind::User(User::WithoutShutdownNonHttp1))
+    }
+
     #[cfg(feature = "http1")]
     pub(super) fn new_shutdown(cause: std::io::Error) -> Error {
         Error::new(Kind::Shutdown).with(cause)
@@ -386,6 +403,7 @@ impl Error {
             #[cfg(feature = "http1")]
             Kind::Parse(Parse::VersionH2) => "invalid HTTP version parsed (found HTTP2 preface)",
             Kind::Parse(Parse::Uri) => "invalid URI",
+            Kind::Parse(Parse::UriTooLong) => "URI too long",
             Kind::Parse(Parse::Header(Header::Token)) => "invalid HTTP header parsed",
             #[cfg(feature = "http1")]
             Kind::Parse(Parse::Header(Header::ContentLengthInvalid)) => {
@@ -410,12 +428,13 @@ impl Error {
             Kind::ChannelClosed => "channel closed",
             Kind::Connect => "error trying to connect",
             Kind::Canceled => "operation was canceled",
-            #[cfg(all(any(feature = "http1", feature = "http2"), feature = "tcp"))]
-            #[cfg(feature = "server")]
+            #[cfg(all(feature = "server", feature = "tcp"))]
             Kind::Listen => "error creating server listener",
             #[cfg(any(feature = "http1", feature = "http2"))]
             #[cfg(feature = "server")]
             Kind::Accept => "error accepting connection",
+            #[cfg(all(feature = "http1", feature = "server", feature = "runtime"))]
+            Kind::HeaderTimeout => "read header from client timeout",
             #[cfg(any(feature = "http1", feature = "http2", feature = "stream"))]
             Kind::Body => "error reading a body from connection",
             #[cfg(any(feature = "http1", feature = "http2"))]
@@ -455,6 +474,10 @@ impl Error {
             Kind::User(User::NoUpgrade) => "no upgrade available",
             #[cfg(feature = "http1")]
             Kind::User(User::ManualUpgrade) => "upgrade expected but low level API in use",
+            #[cfg(feature = "server")]
+            Kind::User(User::WithoutShutdownNonHttp1) => {
+                "without_shutdown() called on a non-HTTP/1 connection"
+            }
             #[cfg(feature = "ffi")]
             Kind::User(User::AbortedByCallback) => "operation aborted by an application callback",
         }

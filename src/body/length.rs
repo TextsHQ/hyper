@@ -50,6 +50,8 @@ impl DecodedLength {
     /// Checks the `u64` is within the maximum allowed for content-length.
     #[cfg(any(feature = "http1", feature = "http2"))]
     pub(crate) fn checked_new(len: u64) -> Result<Self, crate::error::Parse> {
+        use tracing::warn;
+
         if len <= MAX_LEN {
             Ok(DecodedLength(len))
         } else {
@@ -65,6 +67,16 @@ impl DecodedLength {
                 *known -= amt;
             }
         }
+    }
+
+    /// Returns whether this represents an exact length.
+    ///
+    /// This includes 0, which of course is an exact known length.
+    ///
+    /// It would return false if "chunked" or otherwise size-unknown.
+    #[cfg(feature = "http2")]
+    pub(crate) fn is_exact(&self) -> bool {
+        self.0 <= MAX_LEN
     }
 }
 

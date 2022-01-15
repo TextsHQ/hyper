@@ -8,6 +8,7 @@ use futures_util::future::{self, Either, FutureExt as _, TryFutureExt as _};
 use http::header::{HeaderValue, HOST};
 use http::uri::{Port, Scheme};
 use http::{Method, Request, Response, Uri, Version};
+use tracing::{debug, trace, warn};
 
 use super::conn;
 use super::connect::{self, sealed::Connect, Alpn, Connected, Connection};
@@ -17,7 +18,7 @@ use super::pool::{
 #[cfg(feature = "tcp")]
 use super::HttpConnector;
 use crate::body::{Body, HttpBody};
-use crate::common::{exec::BoxSendFuture, lazy as hyper_lazy, task, Future, Lazy, Pin, Poll};
+use crate::common::{exec::BoxSendFuture, sync_wrapper::SyncWrapper, lazy as hyper_lazy, task, Future, Lazy, Pin, Poll};
 use crate::rt::Executor;
 
 /// A Client to make outgoing HTTP requests.
@@ -44,7 +45,7 @@ struct Config {
 /// This is returned by `Client::request` (and `Client::get`).
 #[must_use = "futures do nothing unless polled"]
 pub struct ResponseFuture {
-    inner: Pin<Box<dyn Future<Output = crate::Result<Response<Body>>> + Send>>,
+    inner: SyncWrapper<Pin<Box<dyn Future<Output = crate::Result<Response<Body>>> + Send>>>,
 }
 
 // ===== impl Client =====
@@ -167,9 +168,9 @@ where
             Version::HTTP_10 => {
                 if is_http_connect {
                     warn!("CONNECT is not allowed for HTTP/1.0");
-                    return ResponseFuture::new(Box::pin(future::err(
+                    return ResponseFuture::new(future::err(
                         crate::Error::new_user_unsupported_request_method(),
-                    )));
+                    ));
                 }
             }
             Version::HTTP_2 => (),
@@ -180,11 +181,11 @@ where
         let pool_key = match extract_domain(req.uri_mut(), is_http_connect) {
             Ok(s) => s,
             Err(err) => {
-                return ResponseFuture::new(Box::pin(future::err(err)));
+                return ResponseFuture::new(future::err(err));
             }
         };
 
-        ResponseFuture::new(Box::pin(self.clone().retryably_send_request(req, pool_key)))
+        ResponseFuture::new(self.clone().retryably_send_request(req, pool_key))
     }
 
     async fn retryably_send_request(
@@ -579,8 +580,13 @@ impl<C, B> fmt::Debug for Client<C, B> {
 // ===== impl ResponseFuture =====
 
 impl ResponseFuture {
-    fn new(fut: Pin<Box<dyn Future<Output = crate::Result<Response<Body>>> + Send>>) -> Self {
-        Self { inner: fut }
+    fn new<F>(value: F) -> Self
+    where
+        F: Future<Output = crate::Result<Response<Body>>> + Send + 'static,
+    {
+        Self {
+            inner: SyncWrapper::new(Box::pin(value))
+        }
     }
 
     fn error_version(ver: Version) -> Self {
@@ -601,7 +607,7 @@ impl Future for ResponseFuture {
     type Output = crate::Result<Response<Body>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.inner).poll(cx)
+        self.inner.get_mut().as_mut().poll(cx)
     }
 }
 
@@ -1016,6 +1022,23 @@ impl Builder {
         self
     }
 
+    /// Set whether HTTP/1 connections should try to use vectored writes,
+    /// or always flatten into a single buffer.
+    ///
+    /// Note that setting this to false may mean more copies of body data,
+    /// but may also improve performance when an IO transport doesn't
+    /// support vectored writes well, such as most TLS implementations.
+    ///
+    /// Setting this to true will force hyper to use queued strategy
+    /// which may eliminate unnecessary cloning on some TLS backends
+    ///
+    /// Default is `auto`. In this mode hyper will try to guess which
+    /// mode to use
+    pub fn http1_writev(&mut self, enabled: bool) -> &mut Builder {
+        self.conn_builder.http1_writev(enabled);
+        self
+    }
+
     /// Set whether HTTP/1 connections will write header names as title case at
     /// the socket level.
     ///
@@ -1027,8 +1050,15 @@ impl Builder {
         self
     }
 
-    /// Set whether HTTP/1 connections will write header names as provided
-    /// at the socket level.
+    /// Set whether to support preserving original header cases.
+    ///
+    /// Currently, this will record the original cases received, and store them
+    /// in a private extension on the `Response`. It will also look for and use
+    /// such an extension in any provided `Request`.
+    ///
+    /// Since the relevant extension is still private, there is no way to
+    /// interact with the original cases. The only effect this can have now is
+    /// to forward the cases in a proxy-like fashion.
     ///
     /// Note that this setting does not affect HTTP/2.
     ///
@@ -1211,6 +1241,20 @@ impl Builder {
         self
     }
 
+    /// Set the maximum write buffer size for each HTTP/2 stream.
+    ///
+    /// Default is currently 1MB, but may change.
+    ///
+    /// # Panics
+    ///
+    /// The value must be no larger than `u32::MAX`.
+    #[cfg(feature = "http2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http2_max_send_buf_size(&mut self, max: usize) -> &mut Self {
+        self.conn_builder.http2_max_send_buf_size(max);
+        self
+    }
+
     /// Set whether to retry requests that get disrupted before ever starting
     /// to write.
     ///
@@ -1292,6 +1336,12 @@ impl fmt::Debug for Builder {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    #[test]
+    fn response_future_is_sync() {
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<ResponseFuture>();
+    }
 
     #[test]
     fn set_relative_uri_with_implicit_path() {

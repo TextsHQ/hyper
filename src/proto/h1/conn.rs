@@ -1,12 +1,17 @@
 use std::fmt;
 use std::io;
 use std::marker::PhantomData;
+#[cfg(all(feature = "server", feature = "runtime"))]
+use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use http::header::{HeaderValue, CONNECTION};
 use http::{HeaderMap, Method, Version};
 use httparse::ParserConfig;
 use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(all(feature = "server", feature = "runtime"))]
+use tokio::time::Sleep;
+use tracing::{debug, error, trace};
 
 use super::io::Buffered;
 use super::{Decoder, Encode, EncodedBuf, Encoder, Http1Transaction, ParseContext, Wants};
@@ -46,6 +51,12 @@ where
                 keep_alive: KA::Busy,
                 method: None,
                 h1_parser_config: ParserConfig::default(),
+                #[cfg(all(feature = "server", feature = "runtime"))]
+                h1_header_read_timeout: None,
+                #[cfg(all(feature = "server", feature = "runtime"))]
+                h1_header_read_timeout_fut: None,
+                #[cfg(all(feature = "server", feature = "runtime"))]
+                h1_header_read_timeout_running: false,
                 preserve_header_case: false,
                 title_case_headers: false,
                 h09_responses: false,
@@ -70,6 +81,10 @@ where
         self.io.set_flush_pipeline(enabled);
     }
 
+    pub(crate) fn set_write_strategy_queue(&mut self) {
+        self.io.set_write_strategy_queue();
+    }
+
     pub(crate) fn set_max_buf_size(&mut self, max: usize) {
         self.io.set_max_buf_size(max);
     }
@@ -77,6 +92,10 @@ where
     #[cfg(feature = "client")]
     pub(crate) fn set_read_buf_exact_size(&mut self, sz: usize) {
         self.io.set_read_buf_exact_size(sz);
+    }
+
+    pub(crate) fn set_write_strategy_flatten(&mut self) {
+        self.io.set_write_strategy_flatten();
     }
 
     #[cfg(feature = "client")]
@@ -95,6 +114,11 @@ where
     #[cfg(feature = "client")]
     pub(crate) fn set_h09_responses(&mut self) {
         self.state.h09_responses = true;
+    }
+
+    #[cfg(all(feature = "server", feature = "runtime"))]
+    pub(crate) fn set_http1_header_read_timeout(&mut self, val: Duration) {
+        self.state.h1_header_read_timeout = Some(val);
     }
 
     #[cfg(feature = "server")]
@@ -169,6 +193,12 @@ where
                 cached_headers: &mut self.state.cached_headers,
                 req_method: &mut self.state.method,
                 h1_parser_config: self.state.h1_parser_config.clone(),
+                #[cfg(all(feature = "server", feature = "runtime"))]
+                h1_header_read_timeout: self.state.h1_header_read_timeout,
+                #[cfg(all(feature = "server", feature = "runtime"))]
+                h1_header_read_timeout_fut: &mut self.state.h1_header_read_timeout_fut,
+                #[cfg(all(feature = "server", feature = "runtime"))]
+                h1_header_read_timeout_running: &mut self.state.h1_header_read_timeout_running,
                 preserve_header_case: self.state.preserve_header_case,
                 h09_responses: self.state.h09_responses,
                 #[cfg(feature = "ffi")]
@@ -460,7 +490,7 @@ where
             }
         }
         match self.state.writing {
-            Writing::Init => true,
+            Writing::Init => self.io.can_headers_buf(),
             _ => false,
         }
     }
@@ -538,9 +568,8 @@ where
 
                 #[cfg(feature = "ffi")]
                 {
-                    self.state.on_informational = head
-                        .extensions
-                        .remove::<crate::ffi::OnInformational>();
+                    self.state.on_informational =
+                        head.extensions.remove::<crate::ffi::OnInformational>();
                 }
 
                 Some(encoder)
@@ -790,6 +819,12 @@ struct State {
     /// a body or not.
     method: Option<Method>,
     h1_parser_config: ParserConfig,
+    #[cfg(all(feature = "server", feature = "runtime"))]
+    h1_header_read_timeout: Option<Duration>,
+    #[cfg(all(feature = "server", feature = "runtime"))]
+    h1_header_read_timeout_fut: Option<Pin<Box<Sleep>>>,
+    #[cfg(all(feature = "server", feature = "runtime"))]
+    h1_header_read_timeout_running: bool,
     preserve_header_case: bool,
     title_case_headers: bool,
     h09_responses: bool,

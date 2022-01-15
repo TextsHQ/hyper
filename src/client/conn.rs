@@ -13,17 +13,16 @@
 //! ```no_run
 //! # #[cfg(all(feature = "client", feature = "http1", feature = "runtime"))]
 //! # mod rt {
+//! use tower::ServiceExt;
 //! use http::{Request, StatusCode};
-//! use hyper::{client::conn::Builder, Body};
+//! use hyper::{client::conn, Body};
 //! use tokio::net::TcpStream;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let target_stream = TcpStream::connect("example.com:80").await?;
 //!
-//!     let (mut request_sender, connection) = Builder::new()
-//!         .handshake::<TcpStream, Body>(target_stream)
-//!         .await?;
+//!     let (mut request_sender, connection) = conn::handshake(target_stream).await?;
 //!
 //!     // spawn a task to poll the connection and drive the HTTP state
 //!     tokio::spawn(async move {
@@ -33,11 +32,20 @@
 //!     });
 //!
 //!     let request = Request::builder()
-//!     // We need to manually add the host header because SendRequest does not
+//!         // We need to manually add the host header because SendRequest does not
 //!         .header("Host", "example.com")
 //!         .method("GET")
 //!         .body(Body::from(""))?;
+//!     let response = request_sender.send_request(request).await?;
+//!     assert!(response.status() == StatusCode::OK);
 //!
+//!     // To send via the same connection again, it may not work as it may not be ready,
+//!     // so we have to wait until the request_sender becomes ready.
+//!     request_sender.ready().await?;
+//!     let request = Request::builder()
+//!         .header("Host", "example.com")
+//!         .method("GET")
+//!         .body(Body::from(""))?;
 //!     let response = request_sender.send_request(request).await?;
 //!     assert!(response.status() == StatusCode::OK);
 //!     Ok(())
@@ -60,6 +68,7 @@ use httparse::ParserConfig;
 use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower_service::Service;
+use tracing::{debug, trace};
 
 use super::dispatch;
 use crate::body::HttpBody;
@@ -108,6 +117,7 @@ pin_project! {
 /// Returns a handshake future over some IO.
 ///
 /// This is a shortcut for `Builder::new().handshake(io)`.
+/// See [`client::conn`](crate::client::conn) for more.
 pub async fn handshake<T>(
     io: T,
 ) -> crate::Result<(SendRequest<crate::Body>, Connection<T, crate::Body>)>
@@ -143,6 +153,7 @@ pub struct Builder {
     pub(super) exec: Exec,
     h09_responses: bool,
     h1_parser_config: ParserConfig,
+    h1_writev: Option<bool>,
     h1_title_case_headers: bool,
     h1_preserve_header_case: bool,
     h1_read_buf_exact_size: Option<usize>,
@@ -525,6 +536,7 @@ impl Builder {
         Builder {
             exec: Exec::Default,
             h09_responses: false,
+            h1_writev: None,
             h1_read_buf_exact_size: None,
             h1_parser_config: Default::default(),
             h1_title_case_headers: false,
@@ -586,6 +598,23 @@ impl Builder {
         self
     }
 
+    /// Set whether HTTP/1 connections should try to use vectored writes,
+    /// or always flatten into a single buffer.
+    ///
+    /// Note that setting this to false may mean more copies of body data,
+    /// but may also improve performance when an IO transport doesn't
+    /// support vectored writes well, such as most TLS implementations.
+    ///
+    /// Setting this to true will force hyper to use queued strategy
+    /// which may eliminate unnecessary cloning on some TLS backends
+    ///
+    /// Default is `auto`. In this mode hyper will try to guess which
+    /// mode to use
+    pub fn http1_writev(&mut self, enabled: bool) -> &mut Builder {
+        self.h1_writev = Some(enabled);
+        self
+    }
+
     /// Set whether HTTP/1 connections will write header names as title case at
     /// the socket level.
     ///
@@ -597,8 +626,15 @@ impl Builder {
         self
     }
 
-    /// Set whether HTTP/1 connections will write header names as provided
-    /// at the socket level.
+    /// Set whether to support preserving original header cases.
+    ///
+    /// Currently, this will record the original cases received, and store them
+    /// in a private extension on the `Response`. It will also look for and use
+    /// such an extension in any provided `Request`.
+    ///
+    /// Since the relevant extension is still private, there is no way to
+    /// interact with the original cases. The only effect this can have now is
+    /// to forward the cases in a proxy-like fashion.
     ///
     /// Note that this setting does not affect HTTP/2.
     ///
@@ -825,7 +861,26 @@ impl Builder {
         self
     }
 
+    /// Set the maximum write buffer size for each HTTP/2 stream.
+    ///
+    /// Default is currently 1MB, but may change.
+    ///
+    /// # Panics
+    ///
+    /// The value must be no larger than `u32::MAX`.
+    #[cfg(feature = "http2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http2_max_send_buf_size(&mut self, max: usize) -> &mut Self {
+        assert!(max <= std::u32::MAX as usize);
+        self.h2_builder.max_send_buffer_size = max;
+        self
+    }
+
     /// Constructs a connection with the configured options and IO.
+    /// See [`client::conn`](crate::client::conn) for more.
+    ///
+    /// Note, if [`Connection`] is not `await`-ed, [`SendRequest`] will
+    /// do nothing.
     pub fn handshake<T, B>(
         &self,
         io: T,
@@ -847,6 +902,13 @@ impl Builder {
                 Proto::Http1 => {
                     let mut conn = proto::Conn::new(io);
                     conn.set_h1_parser_config(opts.h1_parser_config);
+                    if let Some(writev) = opts.h1_writev {
+                        if writev {
+                            conn.set_write_strategy_queue();
+                        } else {
+                            conn.set_write_strategy_flatten();
+                        }
+                    }
                     if opts.h1_title_case_headers {
                         conn.set_title_case_headers();
                     }

@@ -9,6 +9,7 @@ use futures_util::stream::StreamExt as _;
 use h2::client::{Builder, SendRequest};
 use http::{Method, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tracing::{debug, trace, warn};
 
 use super::{ping, H2Upgraded, PipeToSendStream, SendBuf};
 use crate::body::HttpBody;
@@ -37,6 +38,7 @@ const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 1000;
 const DEFAULT_CONN_WINDOW: u32 = 1024 * 1024 * 5; // 5mb
 const DEFAULT_STREAM_WINDOW: u32 = 1024 * 1024 * 2; // 2mb
 const DEFAULT_MAX_FRAME_SIZE: u32 = 1024 * 16; // 16kb
+const DEFAULT_MAX_SEND_BUF_SIZE: usize = 1024 * 1024; // 1mb
 
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
@@ -53,6 +55,7 @@ pub(crate) struct Config {
     #[cfg(feature = "runtime")]
     pub(crate) keep_alive_while_idle: bool,
     pub(crate) max_concurrent_reset_streams: Option<usize>,
+    pub(crate) max_send_buffer_size: usize,
 }
 
 impl Default for Config {
@@ -71,6 +74,7 @@ impl Default for Config {
             #[cfg(feature = "runtime")]
             keep_alive_while_idle: false,
             max_concurrent_reset_streams: None,
+            max_send_buffer_size: DEFAULT_MAX_SEND_BUF_SIZE,
         }
     }
 }
